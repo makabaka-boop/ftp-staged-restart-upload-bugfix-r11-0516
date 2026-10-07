@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 
-# The service is a single standard-library Python process; no site packages.
+# The service is a small set of standard-library-only Python modules; no
+# site packages.
 WORKDIR /app
-COPY server.py /app/server.py
+COPY server.py upload.py filestore.py /app/
 
 ENV FTP_HOST=0.0.0.0 \
     FTP_PORT=2121 \

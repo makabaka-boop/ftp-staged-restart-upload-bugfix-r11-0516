@@ -162,6 +162,13 @@ class Transfer:
         await self.session.transfer_reply(self, code, message)
         self.terminal_reply_done.set()
 
+    async def _conclude_failure(self) -> None:
+        await self._conclude(
+            STATE_FAILED,
+            426,
+            "Connection closed; transfer aborted.",
+        )
+
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         try:
@@ -260,7 +267,6 @@ class Transfer:
 @dataclass
 class UploadTransfer(Transfer):
     plan: object = None
-    mode: str = "store"
 
     async def run(self):
         from upload import run_upload
@@ -553,16 +559,21 @@ class FtpSession:
         transfer.task = asyncio.create_task(transfer.run())
 
     async def cmd_stor(self, argument):
+        if not argument or any(ch.isspace() for ch in argument):
+            await self.reply(501, "STOR requires a file name.")
+            return
         if not self.binary_type:
             await self.reply(504, "Use TYPE I before STOR.")
             return
-        offset = self.pending_restart
-        self.pending_restart = None
+
+        # Validate without mutating anything: a rejected STOR consumes
+        # neither the restart marker nor the passive listener.
         try:
-            plan = self.store.prepare(argument, offset)
+            plan = self.store.prepare(argument, self.pending_restart)
         except UploadRejected as error:
             await self.reply(550, str(error))
             return
+
         async with self.state_lock:
             if self.active_transfer is not None:
                 await self.reply(503, "Active transfer in progress.")
@@ -571,21 +582,28 @@ class FtpSession:
             if listener is None:
                 await self.reply(425, "Use EPSV before STOR.")
                 return
+
+            # Accepted STOR exclusively consumes both the restart state and
+            # the current passive listener.
             self.pending_listener = None
+            restart = self.pending_restart
             self.pending_restart = None
             transfer = UploadTransfer(
                 session=self,
                 generation=listener.generation,
                 filename=argument,
                 data=b"",
-                start_offset=offset or 0,
+                start_offset=restart or 0,
                 listener=listener,
                 hooks=self.hooks,
                 accept_timeout=self.accept_timeout,
                 plan=plan,
             )
             self.active_transfer = transfer
-        await self.reply(150, "Opening BINARY upload data connection.")
+
+        # Never hold the session state lock while writing on the control
+        # socket: a blocked drain here would otherwise freeze ABOR.
+        await self.reply(150, "Opening BINARY mode data connection for upload.")
         transfer.task = asyncio.create_task(transfer.run())
 
     async def cmd_abor(self, argument: str) -> None:

@@ -57,6 +57,31 @@ class ForcedSendFailureHooks(SessionHooks):
             raise ConnectionResetError("simulated data failure")
 
 
+class UploadGateHooks(SessionHooks):
+    """Park selected uploads inside the data read loop, on demand.
+
+    While ``armed`` is true the next matching first-block upload waits on
+    the gate; arming only after a peer has finished keeps the peer's own
+    upload out of the gate.
+    """
+
+    def __init__(self, gate_names=("colors.bin",)):
+        self.gate = Gate()
+        self.gate_names = set(gate_names)
+        self.armed = False
+
+    async def after_write(self, transfer, cursor, chunk):
+        # Downloads have non-empty data; uploads start from an empty buffer.
+        if (
+            self.armed
+            and transfer.data == b""
+            and cursor == len(chunk)
+            and transfer.filename in self.gate_names
+        ):
+            self.armed = False
+            await self.gate.wait()
+
+
 class FtpControl:
     def __init__(self, reader, writer):
         self.reader = reader
@@ -151,6 +176,50 @@ async def recv_all(sock):
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
+
+
+async def start_upload(control, name, port, restart=None):
+    """EPSV/REST are arranged by callers; this connects data and arms STOR."""
+    data_sock = await connect_data(port)
+    if restart is not None:
+        await control.send(f"REST {restart}\r\n")
+        await control.code(350)
+    await control.send(f"STOR {name}\r\n")
+    await control.code(150)
+    return data_sock
+
+
+async def send_upload(data_sock, payload, shutdown_write=True):
+    loop = asyncio.get_running_loop()
+    if payload is not None:
+        with contextlib.suppress(ConnectionError, OSError):
+            await loop.sock_sendall(data_sock, payload)
+    if shutdown_write:
+        with contextlib.suppress(OSError):
+            data_sock.shutdown(socket.SHUT_WR)
+
+
+async def retr_simple(port, name):
+    control = await connect_control(port)
+    await login(control)
+    await control.send("TYPE I\r\n")
+    await control.code(200)
+    await control.send("EPSV\r\n")
+    code, line = await asyncio.wait_for(control.replies.get(), 5)
+    assert code == 229, line
+    dport = int(re.search(rb"\(\|\|\|(\d+)\|\)", line).group(1))
+    data_sock = await connect_data(dport)
+    await control.send(f"RETR {name}\r\n")
+    next_code = await control.code()
+    if next_code != 150:
+        await control.close()
+        data_sock.close()
+        return None, next_code
+    data = await recv_all(data_sock)
+    await control.code(226)
+    data_sock.close()
+    await control.close()
+    return data, 226
 
 
 class FtpServerTests(unittest.IsolatedAsyncioTestCase):
@@ -449,6 +518,539 @@ class FtpServerTests(unittest.IsolatedAsyncioTestCase):
         await control.send("ABOR\r\n")
         await control.code(225)
         await control.close()
+
+
+class FtpUploadTests(unittest.IsolatedAsyncioTestCase):
+    """Real dual-TCP tests for the passive STOR publish semantics."""
+
+    hooks = None
+
+    async def asyncSetUp(self):
+        self.server = await start_server(
+            host="127.0.0.1",
+            port=0,
+            passive_ports=(0, 0),
+            accept_timeout=0.5,
+            hooks=self.hooks() if self.hooks is not None else SessionHooks(),
+        )
+        self.port = self.server.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def session(self):
+        control = await connect_control(self.port)
+        await login(control, split_commands=True)
+        await control.send("TYPE I\r\n")
+        await control.code(200)
+        return control
+
+    async def stor(self, name, payload, restart=None, expect=226, keep=False):
+        control = await self.session()
+        port = await epsv(control)
+        data_sock = await start_upload(control, name, port, restart=restart)
+        await send_upload(data_sock, payload)
+        code = await control.code()
+        assert code == expect, f"expected {expect}, got {code}"
+        if not keep:
+            data_sock.close()
+            await control.close()
+        return control, data_sock
+
+    async def read_file(self, name):
+        data, code = await retr_simple(self.port, name)
+        assert code == 226, code
+        return data
+
+    async def test_full_stor_replaces_and_each_publish_is_a_version(self):
+        assert await self.read_file("colors.bin") == FILES["colors.bin"]
+
+        await self.stor("colors.bin", b"AAAA")
+        assert await self.read_file("colors.bin") == b"AAAA"
+
+        # Same bytes, but every successful publish is a new version: a peer
+        # started from the pre-AAAA version must now lose the race.
+        control_a = await self.session()
+        control_b = await self.session()
+        port_a = await epsv(control_a)
+        port_b = await epsv(control_b)
+        sock_a = await start_upload(control_a, "colors.bin", port_a)
+        sock_b = await start_upload(control_b, "colors.bin", port_b)
+
+        await send_upload(sock_a, b"BBBB")
+        await control_a.code(226)
+        await send_upload(sock_b, b"BBBB")
+        await control_b.code(426)
+        sock_a.close()
+        sock_b.close()
+        await control_a.close()
+        await control_b.close()
+
+        assert await self.read_file("colors.bin") == b"BBBB"
+
+    async def test_rest_keeps_prefix_replaces_suffix_rest_zero_replaces(self):
+        await self.stor("f.bin", b"0123456789")
+        await self.stor("f.bin", b"AB", restart=4)
+        assert await self.read_file("f.bin") == b"0123AB"
+
+        # REST 0 is valid and is a full replacement.
+        await self.stor("f.bin", b"zzz", restart=0)
+        assert await self.read_file("f.bin") == b"zzz"
+
+    async def test_rest_requires_existing_file_within_current_length(self):
+        control = await self.session()
+        port = await epsv(control)
+        await control.send("REST 0\r\n")
+        await control.code(350)
+        await control.send("STOR ghost.bin\r\n")
+        await control.code(550)
+        # Neither REST nor EPSV consumed: no EPSV before this accepted STOR.
+        data_sock = await connect_data(port)
+        await control.send("STOR colors.bin\r\n")
+        await control.code(150)
+        await send_upload(data_sock, b"Q")
+        await control.code(226)
+        data_sock.close()
+        assert await self.read_file("colors.bin") == b"Q"
+        await control.close()
+
+        # Offset beyond EOF is rejected and leaves REST in place; the stale
+        # REST 2 is unusable for this 1-byte file, so clear it explicitly
+        # and verify a fresh accepted STOR works on the unchanged content.
+        control = await self.session()
+        await control.send("REST 2\r\n")
+        await control.code(350)
+        port = await epsv(control)
+        await control.send("STOR colors.bin\r\n")
+        await control.code(550)
+        assert await self.read_file("colors.bin") == b"Q"
+        await control.send("REST 0\r\n")
+        await control.code(350)
+        data_sock = await start_upload(control, "colors.bin", port)
+        await send_upload(data_sock, b"Z")
+        await control.code(226)
+        data_sock.close()
+        assert await self.read_file("colors.bin") == b"Z"
+        await control.close()
+
+    async def test_rejected_stor_does_not_consume_epsv_or_rest(self):
+        control = await self.session()
+        await control.send("REST 5\r\n")
+        await control.code(350)
+        # No EPSV at all.
+        await control.send("STOR colors.bin\r\n")
+        await control.code(425)
+        # Bad filename: REST must survive again.
+        port = await epsv(control)
+        await control.send("STOR ../escape\r\n")
+        await control.code(550)
+        data_sock = await start_upload(control, "colors.bin", port)
+        await send_upload(data_sock, b"X")
+        await control.code(226)
+        data_sock.close()
+        assert await self.read_file("colors.bin") == FILES["colors.bin"][:5] + b"X"
+        await control.close()
+
+        # STOR without TYPE I is rejected without consuming EPSV on a fresh
+        # session that never switched type.
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        raw = FtpControl(reader, writer)
+        await raw.code(220)
+        await login(raw)
+        port = await epsv(raw)
+        await raw.send("STOR colors.bin\r\n")
+        await raw.code(504)
+        data_sock = await connect_data(port)
+        await raw.send("TYPE I\r\n")
+        await raw.code(200)
+        await raw.send("STOR colors.bin\r\n")
+        await raw.code(150)
+        await send_upload(data_sock, b"T")
+        await raw.code(226)
+        data_sock.close()
+        await raw.close()
+
+    async def test_upload_is_invisible_until_226_even_to_concurrent_retr(self):
+        self.server.close()
+        await self.server.wait_closed()
+        hooks = UploadGateHooks()
+        self.server = await start_server(
+            host="127.0.0.1",
+            port=0,
+            passive_ports=(0, 0),
+            accept_timeout=1,
+            hooks=hooks,
+        )
+        self.port = self.server.sockets[0].getsockname()[1]
+
+        control = await self.session()
+        port = await epsv(control)
+        # Connect data but send nothing yet, so the transfer reaches ACTIVE
+        # and parks only after the peer below has fully published.
+        data_sock = await connect_data(port)
+        await control.send("STOR colors.bin\r\n")
+        await control.code(150)
+
+        # A different session replaces the file while this upload is parked
+        # at its first block: the parked upload's later bytes must never be
+        # visible and its finish must lose the version race.
+        assert await self.read_file("colors.bin") == FILES["colors.bin"]
+        peer = await self.session()
+        peer_port = await epsv(peer)
+        peer_sock = await connect_data(peer_port)
+        await peer.send("REST 3\r\n")
+        await peer.code(350)
+        await peer.send("STOR colors.bin\r\n")
+        await peer.code(150)
+        await send_upload(peer_sock, b"!!!")
+        await peer.code(226)
+        peer_sock.close()
+        await peer.close()
+        assert await self.read_file("colors.bin") == FILES["colors.bin"][:3] + b"!!!"
+
+        # Now drive the victim upload: its bytes must not become visible
+        # while it is parked, and its finish loses the version race.
+        hooks.armed = True
+        await send_upload(data_sock, b"NEW")
+        await hooks.gate.entered.wait()
+        assert await self.read_file("colors.bin") == FILES["colors.bin"][:3] + b"!!!"
+        hooks.gate.release()
+        await send_upload(data_sock, None)
+        await control.code(426)
+        data_sock.close()
+        await control.close()
+
+        assert await self.read_file("colors.bin") == FILES["colors.bin"][:3] + b"!!!"
+
+    async def test_abor_during_upload_publishes_nothing(self):
+        self.server.close()
+        await self.server.wait_closed()
+        hooks = UploadGateHooks()
+        self.server = await start_server(
+            host="127.0.0.1",
+            port=0,
+            passive_ports=(0, 0),
+            accept_timeout=1,
+            hooks=hooks,
+        )
+        self.port = self.server.sockets[0].getsockname()[1]
+
+        control = await self.session()
+        port = await epsv(control)
+        data_sock = await start_upload(control, "colors.bin", port)
+        hooks.armed = True
+        await send_upload(data_sock, b"ABORT-ME", shutdown_write=False)
+        await hooks.gate.entered.wait()
+
+        await control.send("TYPE I\r\n")
+        await control.code(503)
+        await control.send("ABOR\r\n")
+        await control.code(426)
+        await control.code(226)
+        hooks.gate.release()
+        data_sock.close()
+        await asyncio.sleep(0.05)
+        assert control.replies.empty()
+        await control.close()
+
+        assert await self.read_file("colors.bin") == FILES["colors.bin"]
+
+        # The aborted STOR consumed its listener/restart state.
+        control = await self.session()
+        await control.send("STOR colors.bin\r\n")
+        await control.code(425)
+        port = await epsv(control)
+        data_sock = await connect_data(port)
+        await control.send("STOR colors.bin\r\n")
+        await control.code(150)
+        await send_upload(data_sock, b"RECOVERED")
+        await control.code(226)
+        data_sock.close()
+        assert await self.read_file("colors.bin") == b"RECOVERED"
+        await control.close()
+
+    async def test_control_disconnect_during_upload_publishes_nothing(self):
+        self.server.close()
+        await self.server.wait_closed()
+        hooks = UploadGateHooks()
+        self.server = await start_server(
+            host="127.0.0.1",
+            port=0,
+            passive_ports=(0, 0),
+            accept_timeout=1,
+            hooks=hooks,
+        )
+        self.port = self.server.sockets[0].getsockname()[1]
+
+        control = await self.session()
+        port = await epsv(control)
+        data_sock = await start_upload(control, "colors.bin", port)
+        hooks.armed = True
+        await send_upload(data_sock, b"ORPHAN", shutdown_write=False)
+        await hooks.gate.entered.wait()
+
+        await control.close()
+        hooks.gate.release()
+        # Deliver the rest and EOF on the orphaned data connection.
+        with contextlib.suppress(OSError):
+            await asyncio.get_running_loop().sock_sendall(data_sock, b"TAIL")
+        with contextlib.suppress(OSError):
+            data_sock.shutdown(socket.SHUT_WR)
+        await asyncio.sleep(0.1)
+        data_sock.close()
+
+        assert await self.read_file("colors.bin") == FILES["colors.bin"]
+
+    async def test_oversize_upload_fails_426_and_leaves_file_untouched(self):
+        await self.stor("colors.bin", b"SMALL")
+
+        # Fresh full STOR over the limit.
+        control = await self.session()
+        port = await epsv(control)
+        data_sock = await start_upload(control, "colors.bin", port)
+        await send_upload(data_sock, b"x" * (32768 + 1))
+        await control.code(426)
+        data_sock.close()
+        await control.close()
+        assert await self.read_file("colors.bin") == b"SMALL"
+
+        # REST prefix plus new bytes over the limit: prefix must survive.
+        await self.stor("f.bin", b"y" * 32768)
+        control = await self.session()
+        await control.send("REST 10\r\n")
+        await control.code(350)
+        port = await epsv(control)
+        data_sock = await start_upload(control, "f.bin", port, restart=10)
+        await send_upload(data_sock, b"z" * (32768 - 10 + 1))
+        await control.code(426)
+        data_sock.close()
+        await control.close()
+        assert await self.read_file("f.bin") == b"y" * 32768
+
+        # Exactly at the limit is a valid publish.
+        await self.stor("g.bin", b"w" * 32768)
+        assert await self.read_file("g.bin") == b"w" * 32768
+
+    async def test_data_failure_during_upload_is_426_without_publish(self):
+        self.server.close()
+        await self.server.wait_closed()
+
+        class UploadFailureHooks(SessionHooks):
+            def __init__(self):
+                self.fired = False
+
+            async def after_write(self, transfer, cursor, chunk):
+                if transfer.data == b"" and not self.fired:
+                    self.fired = True
+                    raise ConnectionResetError("simulated data failure")
+
+        self.server = await start_server(
+            host="127.0.0.1",
+            port=0,
+            passive_ports=(0, 0),
+            accept_timeout=1,
+            hooks=UploadFailureHooks(),
+        )
+        self.port = self.server.sockets[0].getsockname()[1]
+
+        control = await self.session()
+        port = await epsv(control)
+        data_sock = await start_upload(control, "colors.bin", port)
+        await send_upload(data_sock, b"BROKEN")
+        await control.code(426)
+        data_sock.close()
+        await control.close()
+        assert await self.read_file("colors.bin") == FILES["colors.bin"]
+
+    async def test_upload_accept_timeout_is_425_and_rest_listener_are_gone(self):
+        control = await self.session()
+        port = await epsv(control)
+        await control.send("STOR colors.bin\r\n")
+        await control.code(150)
+        await control.code(425)
+        await control.send("ABOR\r\n")
+        await control.code(225)
+        # Listener consumed by the accepted STOR even though nobody dialed in.
+        with self.assertRaises((ConnectionRefusedError, OSError)):
+            probe = data_socket()
+            try:
+                await asyncio.get_running_loop().sock_connect(
+                    probe, ("127.0.0.1", port)
+                )
+            finally:
+                probe.close()
+        assert await self.read_file("colors.bin") == FILES["colors.bin"]
+        await control.close()
+
+    async def test_new_file_race_from_same_version_publishes_exactly_once(self):
+        control_a = await self.session()
+        control_b = await self.session()
+        port_a = await epsv(control_a)
+        port_b = await epsv(control_b)
+        sock_a = await start_upload(control_a, "new.bin", port_a)
+        sock_b = await start_upload(control_b, "new.bin", port_b)
+
+        # Neither is committed before both are armed: both plans are based on
+        # "no such file".
+        await asyncio.sleep(0.05)
+        await send_upload(sock_a, b"FIRST")
+        await control_a.code(226)
+        await send_upload(sock_b, b"SECOND")
+        await control_b.code(426)
+        sock_a.close()
+        sock_b.close()
+        await control_a.close()
+        await control_b.close()
+        assert await self.read_file("new.bin") == b"FIRST"
+
+    async def test_upload_completion_and_abor_race_success_wins(self):
+        await self.upload_finish_race(success_wins=True)
+
+    async def test_upload_completion_and_abor_race_abort_wins(self):
+        await self.upload_finish_race(success_wins=False)
+
+    async def upload_finish_race(self, success_wins):
+        self.server.close()
+        await self.server.wait_closed()
+
+        class UploadCompletionRaceHooks(SessionHooks):
+            def __init__(self):
+                self.finish_reached = asyncio.Event()
+                self.finish_allowed = asyncio.Event()
+                self.abort_at_decision = asyncio.Event()
+                self.abort_allowed = asyncio.Event()
+
+            async def before_finish(self, transfer):
+                if transfer.data == b"":
+                    self.finish_reached.set()
+                    await self.finish_allowed.wait()
+
+            async def before_abort_state(self, transfer):
+                if transfer.data == b"":
+                    self.abort_at_decision.set()
+                    await self.abort_allowed.wait()
+
+        hooks = UploadCompletionRaceHooks()
+        self.server = await start_server(
+            host="127.0.0.1",
+            port=0,
+            passive_ports=(0, 0),
+            accept_timeout=1,
+            hooks=hooks,
+        )
+        self.port = self.server.sockets[0].getsockname()[1]
+
+        control = await self.session()
+        port = await epsv(control)
+        data_sock = await start_upload(control, "colors.bin", port)
+        await send_upload(data_sock, b"WON-RACE")
+        await hooks.finish_reached.wait()
+
+        await control.send("ABOR\r\n")
+        await hooks.abort_at_decision.wait()
+
+        if success_wins:
+            # Commit and the success claim are one critical section: ABOR
+            # must find the transfer already terminal once release happens.
+            hooks.finish_allowed.set()
+            await control.code(226)
+            hooks.abort_allowed.set()
+            await control.code(225)
+            assert await self.read_file("colors.bin") == b"WON-RACE"
+        else:
+            hooks.abort_allowed.set()
+            await asyncio.sleep(0.02)
+            hooks.finish_allowed.set()
+            await control.code(426)
+            await control.code(226)
+            # Aborted publish changed nothing.
+            assert await self.read_file("colors.bin") == FILES["colors.bin"]
+
+        data_sock.close()
+        await asyncio.sleep(0.02)
+        assert control.replies.empty()
+        await control.close()
+        self.server.close()
+        await self.server.wait_closed()
+
+        class UploadFinishRaceHooks(SessionHooks):
+            def __init__(self):
+                self.finish_reached = asyncio.Event()
+                self.finish_allowed = asyncio.Event()
+
+            async def before_finish(self, transfer):
+                if transfer.data == b"":
+                    self.finish_reached.set()
+                    await self.finish_allowed.wait()
+
+        hooks = UploadFinishRaceHooks()
+        self.server = await start_server(
+            host="127.0.0.1",
+            port=0,
+            passive_ports=(0, 0),
+            accept_timeout=1,
+            hooks=hooks,
+        )
+        self.port = self.server.sockets[0].getsockname()[1]
+
+        control = await self.session()
+        port = await epsv(control)
+        data_sock = await start_upload(control, "colors.bin", port)
+        await send_upload(data_sock, b"STALE")
+        await hooks.finish_reached.wait()
+        # Old upload is parked at its finish line.  Control dies underneath
+        # it; the session is torn down and the late callback must not
+        # publish, nor survive to address a new session.
+        await control.close()
+        await asyncio.sleep(0.05)
+        hooks.finish_allowed.set()
+        await asyncio.sleep(0.1)
+        data_sock.close()
+        assert await self.read_file("colors.bin") == FILES["colors.bin"]
+
+    async def test_capacity_is_enforced_for_new_files_only(self):
+        # Three demo files already exist; create four more (seven total).
+        for i in range(4):
+            await self.stor(f"f{i}.bin", bytes([i]))
+        control = await self.session()
+        port = await epsv(control)
+        data_sock = await start_upload(control, "eighth.bin", port)
+        await send_upload(data_sock, b"8")
+        await control.code(226)
+        data_sock.close()
+
+        port = await epsv(control)
+        await control.send("STOR ninth.bin\r\n")
+        await control.code(550)
+        # Rejected: EPSV must still be usable for an existing-file replace.
+        data_sock = await start_upload(control, "colors.bin", port)
+        await send_upload(data_sock, b"C")
+        await control.code(226)
+        data_sock.close()
+        await control.close()
+
+        assert await self.read_file("colors.bin") == b"C"
+        data, code = await retr_simple(self.port, "ninth.bin")
+        assert code == 550
+        assert data is None
+
+    async def test_invalid_filenames_are_rejected(self):
+        for bad in ("", ".dot", "a/b", "a b", "x" * 81, "a-ok/b", "-x", "_x"):
+            control = await self.session()
+            port = await epsv(control)
+            await control.send(f"STOR {bad}\r\n" if bad else "STOR\r\n")
+            code = await control.code()
+            assert code in (501, 550), f"{bad!r}: {code}"
+            # EPSV survives the rejection.
+            data_sock = await connect_data(port)
+            await control.send("STOR good.bin\r\n")
+            await control.code(150)
+            await send_upload(data_sock, b"ok")
+            await control.code(226)
+            data_sock.close()
+            await control.close()
+        assert await self.read_file("good.bin") == b"ok"
 
 
 if __name__ == "__main__":

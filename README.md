@@ -1,9 +1,11 @@
-# Read-Only FTP Demo
+# FTP Demo (read + passive upload)
 
-A tiny, dependency-free read-only FTP server demonstrating correct concurrency
+A tiny, dependency-free FTP server demonstrating correct concurrency
 between the **control connection** and **data connections**. A blocked data
 send never blocks the control reader, so `ABOR`, `NOOP`, and `QUIT` remain
-usable while a download is in flight.
+usable while a transfer is in flight. Downloads serve published file
+versions; passive `STOR` uploads publish atomically, so partial or failed
+uploads are never observable.
 
 ## Run
 
@@ -41,11 +43,38 @@ Account: `demo` / `demo-pass`.
 
 ## Supported command set
 
-`USER`, `PASS`, `TYPE I`, `EPSV`, `REST`, `RETR`, `ABOR`, `NOOP`, `QUIT`.
+`USER`, `PASS`, `TYPE I`, `EPSV`, `REST`, `RETR`, `STOR`, `ABOR`, `NOOP`, `QUIT`.
 
-Everything else is rejected with `502`. Upload (`STOR`, `APPE`, ...), active
-mode (`PORT`/`EPRT`), and directory operations (`LIST`, `NLST`, `CWD`, `PWD`,
-`MKD`, `DELE`, ...) are intentionally unsupported. `TYPE` accepts only `I`.
+Everything else is rejected with `502`. Active mode (`PORT`/`EPRT`) and
+directory operations (`LIST`, `NLST`, `CWD`, `PWD`, `MKD`, `DELE`, ...) are
+intentionally unsupported. `TYPE` accepts only `I`.
+
+## Passive binary upload (`STOR`)
+
+`STOR filename` continues to use the fixed account, `TYPE I`, `EPSV`, and
+the existing per-session control state. The store holds at most 8 files,
+each at most 32,768 bytes. A filename is 1–80 ASCII alphanumerics, `.`,
+`_`, or `-`, beginning with an alphanumeric.
+
+* Without `REST`, `STOR` is a **complete replacement**. With `REST k`, the
+  file must already exist and the result is the old `[0,k)` prefix followed
+  by the bytes received up to data-connection EOF; the old suffix is
+  discarded. `REST 0` is a valid replacement.
+* Received bytes are held only by the transfer until the successful
+  terminal state. Nothing is visible to another session or to a concurrent
+  `RETR` before `226`; `ABOR`, control-connection disconnect, a receive
+  error, accept timeout, oversize content, or lost capacity leaves the file
+  untouched.
+* `REST` and the current passive listener are consumed **only by an
+  accepted** `STOR`. A rejected upload (bad name, `REST` against a missing
+  file or past EOF, no listener, over capacity, wrong type) answers `550`,
+  `504`, or `425` and leaves both in place.
+* Every successful publish installs a new version even when the bytes are
+  unchanged. A plan records the version (and REST prefix snapshot) it
+  started from; of two sessions that accepted from the same version, the
+  one that commits first publishes and the other gets `426` without
+  modifying the file. Success is always `226`; data failure `426`; accept
+  timeout `425`; abort answers `426` then `226`, in that order.
 
 ## Concurrency and protocol rules
 
@@ -95,8 +124,11 @@ python3 -m unittest -v
 They cover abort while the data side is slow-reading, zero-byte `REST` and
 offset resume, the end-of-transfer completion race in both orders,
 replacement/late arrival of an old listener, `425`/`426` handling, and
-rejection of unsupported commands.
+rejection of unsupported commands. The upload suite additionally covers
+full replacement vs. `REST` semantics, `REST 0`, rejected `STOR` not
+consuming `REST`/`EPSV`, invisibility of in-flight bytes to a concurrent
+`RETR`, abort/control-disconnect/oversize/receive-failure leaving no file
+change, the same-version publish race across two sessions (exactly one
+`226`), upload completion-vs-`ABOR` races in both orders, and the
+8-file/32,768-byte limits.
 
-
-## 被动二进制上传
-新增 STOR filename，继续使用固定账户、TYPE I、EPSV 和原有控制状态。服务器最多保存 8 个文件、每个最多 32768 字节。文件名仅为 1..80 个 ASCII 字母数字及 ._- 且首字符为字母数字。无 REST 时上传完整替换，REST k 时必须已有文件，保存原内容 [0,k) 后接收到 EOF 的新字节，原来的后缀不保留；REST 0 有效。失败或被拒绝的 STOR 不消费 REST/EPSV，仅接受后独占这些状态。上传内容在成功终态前不对其他会话或 RETR 可见；ABOR、控制连接断开、超限、接收异常或文件已经被另一会话更新时不修改文件。每次成功发布都产生新版本，即使文件字节未变；多个接受到同版本的上传只能有一个成功发布，成功以 226 为准，传输失败 426，接受超时 425，中止回复仍按 426/226 顺序。上传、RETR 和控制会话共享文件存储，旧传输回调不得发布新文件或影响新的传输。
