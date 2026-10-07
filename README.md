@@ -1,9 +1,11 @@
-# Read-Only FTP Demo
+# FTP Demo (downloads + atomic uploads)
 
-A tiny, dependency-free read-only FTP server demonstrating correct concurrency
+A tiny, dependency-free FTP server demonstrating correct concurrency
 between the **control connection** and **data connections**. A blocked data
-send never blocks the control reader, so `ABOR`, `NOOP`, and `QUIT` remain
-usable while a download is in flight.
+transfer never blocks the control reader, so `ABOR`, `NOOP`, and `QUIT`
+remain usable while a download or upload is in flight. Uploads (`STOR`)
+buffer privately and are published to the in-memory store in one atomic
+commit on success.
 
 ## Run
 
@@ -11,13 +13,19 @@ usable while a download is in flight.
 docker compose up --build
 ```
 
-Connect (any FTP client in binary/passive mode works; account is
+Connect (any FTP client in binary/EPSV passive mode works; account is
 `demo` / `demo-pass`):
 
 ```bash
 python3 - <<'PY'
-import ftplib
-ftp = ftplib.FTP()
+import ftplib, re
+
+class EpsvFTP(ftplib.FTP):
+    def makepasv(self):  # this server speaks EPSV only
+        resp = self.sendcmd("EPSV")
+        return self.host, int(re.search(r"\(\|\|\|(\d+)\|\)", resp).group(1))
+
+ftp = EpsvFTP()
 ftp.connect("127.0.0.1", 2121)
 ftp.login("demo", "demo-pass")
 with open("patterns.bin", "wb") as fh:
@@ -28,8 +36,9 @@ PY
 
 ## Fixed demo content
 
-Built into the process — there is no served directory and nothing can be
-written:
+Built into the process — there is no served directory. The store starts with
+three files and accepts `STOR` uploads in memory (at most 8 files total,
+32 KiB each):
 
 | File           | Size      |
 |----------------|-----------|
@@ -41,10 +50,11 @@ Account: `demo` / `demo-pass`.
 
 ## Supported command set
 
-`USER`, `PASS`, `TYPE I`, `EPSV`, `REST`, `RETR`, `ABOR`, `NOOP`, `QUIT`.
+`USER`, `PASS`, `TYPE I`, `EPSV`, `REST`, `RETR`, `STOR`, `ABOR`, `NOOP`,
+`QUIT`.
 
-Everything else is rejected with `502`. Upload (`STOR`, `APPE`, ...), active
-mode (`PORT`/`EPRT`), and directory operations (`LIST`, `NLST`, `CWD`, `PWD`,
+Everything else is rejected with `502`. Append (`APPE`), active mode
+(`PORT`/`EPRT`), and directory operations (`LIST`, `NLST`, `CWD`, `PWD`,
 `MKD`, `DELE`, ...) are intentionally unsupported. `TYPE` accepts only `I`.
 
 ## Concurrency and protocol rules
@@ -55,11 +65,23 @@ mode (`PORT`/`EPRT`), and directory operations (`LIST`, `NLST`, `CWD`, `PWD`,
 * Each `EPSV` opens a fresh passive listener and **replaces** the previous
   one; any connection queued on the old listener but not yet accepted is
   drained and closed, so it can never be mistaken for a later connection.
-* Each accepted `RETR` exclusively owns its listener, data socket, file
-  cursor, terminal state, and terminal reply. Those objects are never shared
-  with a later transfer.
-* `REST offset` is consumed only by the **next accepted** `RETR`. A rejected
-  `RETR` (missing file, offset past EOF, no listener) does not consume it.
+* Each accepted `RETR`/`STOR` exclusively owns its listener, data socket,
+  file cursor, terminal state, and terminal reply. Those objects are never
+  shared with a later transfer.
+* `REST offset` is consumed only by the **next accepted** `RETR`/`STOR`. A
+  rejected command (missing file, invalid name, offset past EOF, no
+  listener, full store) consumes neither the restart marker nor the passive
+  listener.
+* `STOR` without `REST` replaces the whole file; `STOR` with `REST k` keeps
+  the original prefix `[0, k)` and drops the old suffix. `REST 0` is valid.
+* Upload bytes stay private to their transfer: they are never visible to
+  other sessions or `RETR` before the successful terminal state. The store
+  is updated by a single atomic commit after the last byte arrived.
+* Every successful publish advances the file's version, even when the bytes
+  are unchanged. Two uploads accepted against the same version cannot both
+  publish: the later finisher fails with `426` and changes nothing.
+* Failure, `ABOR`, control-connection loss, a receive error, or the
+  size/capacity limit never leave a file change behind.
 * During an active transfer, every command except `ABOR`, `NOOP`, and `QUIT`
   is explicitly rejected with `503`.
 * No data connection accepted within the timeout ⇒ `425`. A data failure while
@@ -95,7 +117,10 @@ python3 -m unittest -v
 They cover abort while the data side is slow-reading, zero-byte `REST` and
 offset resume, the end-of-transfer completion race in both orders,
 replacement/late arrival of an old listener, `425`/`426` handling, and
-rejection of unsupported commands.
+rejection of unsupported commands. Upload tests cover replace/resume
+content semantics, invisibility of partial uploads, abort/disconnect
+leaving no trace, size and capacity limits, the single-publisher rule for
+same-version concurrent uploads, and the upload completion/abort race.
 
 
 ## 被动二进制上传

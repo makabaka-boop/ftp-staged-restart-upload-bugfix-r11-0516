@@ -11,23 +11,24 @@ class UploadRejected(ValueError):
 
 
 class UploadPlan:
-    def __init__(self, store, name, restart):
+    """Validation result for an accepted STOR.
+
+    ``version`` is the store version observed at prepare time.  ``commit``
+    publishes only when the file is still at exactly that version, so two
+    uploads accepted against the same content cannot both succeed.
+    """
+
+    def __init__(self, store, name, restart, version):
         self.store = store
         self.filename = name
         self.restart = restart
-
-    @property
-    def prefix(self):
-        return self.store.read(self.filename) or b""
-
-    @property
-    def version(self):
-        return len(self.store.read(self.filename) or b"")
+        self.version = version
 
 
 class FileStore:
     def __init__(self, files):
         self.files = {name: bytearray(data) for name, data in files.items()}
+        self.versions = {name: 1 for name in files}
 
     def read(self, name):
         data = self.files.get(name)
@@ -45,19 +46,31 @@ class FileStore:
             raise UploadRejected("invalid restart position")
         if current is None and len(self.files) >= CAPACITY:
             raise UploadRejected("file capacity exceeded")
-        return UploadPlan(self, name, restart)
-
-    def expose(self, plan, chunk):
-        current = self.files.setdefault(plan.filename, bytearray())
-        current.extend(chunk)
-        if len(current) > LIMIT:
-            raise UploadRejected("file size exceeded")
+        return UploadPlan(self, name, restart, self.versions.get(name))
 
     def commit(self, plan, payload):
-        current = self.files.setdefault(plan.filename, bytearray())
+        """Publish a fully received upload atomically.
+
+        Every rule is re-checked before anything mutates, so a rejected
+        commit leaves the store exactly as it was.  A successful commit
+        always advances the file's version, even when the bytes are
+        unchanged.
+        """
+        current = self.files.get(plan.filename)
+        if self.versions.get(plan.filename) != plan.version:
+            raise UploadRejected("file changed during upload")
+        if current is None and len(self.files) >= CAPACITY:
+            raise UploadRejected("file capacity exceeded")
         if plan.restart is not None:
-            current[:] = current[: plan.restart] + bytes(payload)
+            if current is None or plan.restart > len(current):
+                raise UploadRejected("invalid restart position")
+            new_content = bytes(current[: plan.restart]) + bytes(payload)
         else:
-            current.extend(payload)
-        if len(current) > LIMIT:
+            new_content = bytes(payload)
+        if len(new_content) > LIMIT:
             raise UploadRejected("file size exceeded")
+        if current is None:
+            self.files[plan.filename] = bytearray(new_content)
+        else:
+            current[:] = new_content
+        self.versions[plan.filename] = (plan.version or 0) + 1

@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # The service is a single standard-library Python process; no site packages.
 WORKDIR /app
-COPY server.py /app/server.py
+COPY server.py filestore.py upload.py /app/
 
 ENV FTP_HOST=0.0.0.0 \
     FTP_PORT=2121 \

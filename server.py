@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Small, read-only FTP demo server.
+"""Small FTP demo server with downloads and atomic uploads.
 
 The implementation deliberately keeps the control-connection command loop and
-each RETR data transfer in separate tasks.  A transfer owns its passive
-listener, accepted socket, file cursor, terminal state, and terminal reply;
-those objects are never reused by a later transfer.
+each data transfer in separate tasks.  A transfer owns its passive listener,
+accepted socket, file cursor, terminal state, and terminal reply; those
+objects are never reused by a later transfer.  Uploads buffer privately and
+publish to the shared store in one atomic commit on success.
 """
 
 from __future__ import annotations
@@ -260,7 +261,6 @@ class Transfer:
 @dataclass
 class UploadTransfer(Transfer):
     plan: object = None
-    mode: str = "store"
 
     async def run(self):
         from upload import run_upload
@@ -553,16 +553,20 @@ class FtpSession:
         transfer.task = asyncio.create_task(transfer.run())
 
     async def cmd_stor(self, argument):
+        if not argument or any(ch.isspace() for ch in argument):
+            await self.reply(501, "STOR requires a file name.")
+            return
         if not self.binary_type:
             await self.reply(504, "Use TYPE I before STOR.")
             return
-        offset = self.pending_restart
-        self.pending_restart = None
+
         try:
-            plan = self.store.prepare(argument, offset)
+            plan = self.store.prepare(argument, self.pending_restart)
         except UploadRejected as error:
+            # A rejected STOR consumes neither REST nor the passive listener.
             await self.reply(550, str(error))
             return
+
         async with self.state_lock:
             if self.active_transfer is not None:
                 await self.reply(503, "Active transfer in progress.")
@@ -571,6 +575,9 @@ class FtpSession:
             if listener is None:
                 await self.reply(425, "Use EPSV before STOR.")
                 return
+
+            # This accepted STOR exclusively consumes both restart state and
+            # the current passive listener.
             self.pending_listener = None
             self.pending_restart = None
             transfer = UploadTransfer(
@@ -578,13 +585,16 @@ class FtpSession:
                 generation=listener.generation,
                 filename=argument,
                 data=b"",
-                start_offset=offset or 0,
+                start_offset=plan.restart or 0,
                 listener=listener,
                 hooks=self.hooks,
                 accept_timeout=self.accept_timeout,
                 plan=plan,
             )
             self.active_transfer = transfer
+
+        # Never hold the session state lock while writing on the control
+        # socket: a blocked drain here would otherwise freeze ABOR.
         await self.reply(150, "Opening BINARY upload data connection.")
         transfer.task = asyncio.create_task(transfer.run())
 

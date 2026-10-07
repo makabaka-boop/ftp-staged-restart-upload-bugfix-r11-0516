@@ -6,7 +6,7 @@ services:
     ports:
       - "2121:2121"
       # Fixed passive range advertised by EPSV; each EPSV replaces the
-      # previous listener and each RETR consumes one listener exclusively.
+      # previous listener and each RETR/STOR consumes one exclusively.
       - "21100-21120:21100-21120"
     environment:
       FTP_HOST: "0.0.0.0"
